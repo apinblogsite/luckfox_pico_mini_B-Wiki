@@ -1,0 +1,18 @@
+[Unit]
+Description=Luckfox WiFi (RTL8188EU via wpa_supplicant)
+After=multi-user.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Jeda agar sistem tenang dulu. Menjalankan penyambungan dari rc.local
+# (fase boot yang sibuk) terbukti membuat board hang.
+ExecStartPre=/bin/sleep 15
+ExecStart=/usr/local/sbin/luckfox-wifi-up.sh
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

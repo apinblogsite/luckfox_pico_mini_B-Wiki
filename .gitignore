@@ -1,0 +1,7 @@
+# Cadangan spesifik perangkat -- jangan dipublikasikan
+backup/
+*.bin
+*.img
+*.bak
+*.log
+__pycache__/
