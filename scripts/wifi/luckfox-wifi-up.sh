@@ -6,10 +6,10 @@
 # untuk memakai DHCP (lihat blok di bawah).
 
 CONF=/etc/wpa_supplicant/wpa_supplicant-wlan0.conf
-IPADDR=192.168.8.139
+IPADDR=192.168.1.50      # GANTI sesuai jaringan Anda
 PREFIX=24
-GATEWAY=192.168.8.1
-DNS1=192.168.8.1
+GATEWAY=192.168.1.1     # GANTI
+DNS1=192.168.1.1        # GANTI
 DNS2=1.1.1.1
 
 [ -f "$CONF" ] || { echo "config wifi tidak ada"; exit 0; }

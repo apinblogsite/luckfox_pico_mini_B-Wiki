@@ -514,7 +514,7 @@ password. Akun root sendiri aktif (`passwd -S root` → `P`), dan di konsol seri
 Jalur yang benar lewat SSH:
 
 ```bash
-ssh pico@<ip-board>
+ssh pico@<IP-BOARD>
 sudo -i
 ```
 
@@ -839,15 +839,15 @@ Hasilnya `8188eu.ko` (1,16 MB setelah strip), vermagic cocok, dan **hanya bergan
 `dhclient` adalah pemicu crash tersering, jadi dihapus dari persamaan. Skrip penyambung memakai:
 
 ```sh
-ip addr add 192.168.8.139/24 dev "$IF"
-ip route add default via 192.168.8.1 dev "$IF"
+ip addr add <IP-BOARD>/24 dev "$IF"
+ip route add default via <GATEWAY> dev "$IF"
 ```
 
 Driver baru mendukung nl80211 dengan benar (`CONFIG_IOCTL_CFG80211`), jadi `-D wext` tidak lagi
 wajib — tapi skrip mencoba nl80211 dulu lalu jatuh ke wext, supaya aman terhadap keduanya.
 
 Alternatif yang lebih rapi kalau Anda mengelola router: buat **DHCP reservation** untuk MAC
-`6c:4c:bc:88:e0:5a`, sehingga board tetap memakai DHCP tapi selalu mendapat alamat sama.
+`<MAC-DONGLE>`, sehingga board tetap memakai DHCP tapi selalu mendapat alamat sama.
 
 ### 9.10 Hasil setelah penggantian
 
