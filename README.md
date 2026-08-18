@@ -922,64 +922,27 @@ kalau file dibuat di Windows.
 
 ## Bagian 11 — Kamera CSI (SC3336)
 
-### 11.1 Yang terbukti bekerja
+**Kamera BISA berjalan di image Ubuntu.** Kesimpulan awal saya — bahwa RAM 56 MB terlalu sempit
+dan kamera hanya mungkin di Buildroot — **terbukti salah**.
 
-Seluruh rantai hardware dan driver hadir dan benar:
+Penyebab sebenarnya dua hal, keduanya bisa diperbaiki:
 
-| Komponen | Bukti |
-|---|---|
-| ISP internal RV1103 | `rkisp_hw ffa00000.rkisp` di dmesg |
-| MIPI CSI-2 di device tree | `csi2-dphy0/1/2`, `mipi-csi2-hw@ffa20000`, `rkcif-mipi-lvds` |
-| Node V4L2 | `/dev/video0`–`video10`, `/dev/media0`, 3 `v4l-subdev` |
-| Driver termuat | `video_rkisp`, `video_rkcif`, `phy_rockchip_csi2_dphy`, `rockit`, `mpp_vcodec`, `rga3` |
-| Sensor terdeteksi fisik | `sc3336 4-0030: Detected OV00cc41 sensor` (chip ID `0xcc41` = SC3336) |
+1. **Fragmentasi memori**, bukan kekurangan RAM. `devm_kmalloc` di `rkisp_plat_probe` butuh
+   halaman fisik kontigu orde tinggi. `/proc/buddyinfo` menunjukkan orde-8 berjumlah **nol**
+   padahal `MemFree` 17 MB. Setelah `drop_caches` + `compact_memory`, probe berhasil.
+2. **Urutan pemuatan modul**. Sensor harus terdaftar sebelum `video_rkcif` probe, kalau tidak
+   async notifier gagal menautkannya (`remote pad is null`).
 
-Driver sensor yang tersedia di image ini hanya **`sc3336.ko`** dan **`mis5001.ko`** — `insmod_ko.sh`
-menyebut banyak sensor lain (imx415, sc4336, gc2053, …) tapi file `.ko`-nya tidak disertakan.
+Terbukti menangkap frame nyata pada 320×240 dan 640×480. Resolusi lebih tinggi dibatasi CMA
+bawaan 1 MB — dan **di situlah** menaikkan `rk_dma_heap_cma` benar-benar tepat, berbeda dari
+percobaan awal saya yang menaikkannya untuk memperbaiki probe ISP (tidak berhasil dan justru
+memangkas `MemTotal` 15 MB).
 
-Cara memeriksa sendiri:
+> Catatan untuk pembaca: baris `No reserved memory region. default cma area!` **bukan** penyebab
+> kegagalan probe, hanya informasi. Saya sempat mengejarnya berjam-jam ke arah yang salah.
 
-```bash
-dmesg | grep -iE 'sc3336|rkisp|rkcif'
-ls /sys/bus/i2c/drivers/sc3336/     # harus ada simlink 4-0030
-ls /dev/video* /dev/media*
-```
-
-### 11.2 Yang menghalangi: ISP gagal probe
-
-```
-rkisp_hw ffa00000.rkisp: No reserved memory region. default cma area!
-[<b0228c3b>] (devm_kmalloc) from [<af863e0d>] (rkisp_plat_probe+0x39/0x514 [video_rkisp])
-rkisp: probe of rkisp-vir0 failed with error -12
-```
-
-Error `-12` = **ENOMEM**. Yang gagal adalah **`devm_kmalloc`** — alokasi memori kernel biasa,
-**bukan** CMA.
-
-> **Jebakan yang memakan waktu:** baris `No reserved memory region. default cma area!` terlihat
-> seperti penyebab, padahal hanya informasi bahwa ISP akan memakai CMA default. Menaikkan
-> `rk_dma_heap_cma` dari 1M ke 16M **tidak memperbaiki apa pun** dan justru menyunat `MemTotal`
-> dari 57 MB jadi 42 MB — memperburuk keadaan, karena `devm_kmalloc` butuh RAM normal.
-> Diuji langsung, lalu dikembalikan.
-
-### 11.3 Akar masalah
-
-Board punya 56 MB RAM, dan image **Ubuntu** memakannya untuk systemd, journald, NetworkManager,
-dan sshd — `MemFree` tercatat serendah 1 MB. Driver ISP butuh alokasi besar yang tidak tersedia.
-
-Ini bukan salah konfigurasi yang bisa disiasati. Luckfox merancang jalur kamera untuk image
-**Buildroot**, yang jejak memorinya jauh lebih kecil. Ubuntu dipilih demi kenyamanan, dan
-kamera adalah harganya.
-
-### 11.4 Pilihan
-
-| Tujuan | Jalan |
-|---|---|
-| Kamera berfungsi | Flash ulang dengan image **Buildroot** Luckfox — prosedur flash-nya identik (Bagian 4), hanya berkas firmware yang berbeda |
-| Ubuntu + WiFi + SSH | Biarkan `rk_dma_heap_cma=1M`; kamera tidak berfungsi tapi board stabil |
-| Ingin coba di Ubuntu | Pangkas layanan (`NetworkManager` sudah tidak dipakai untuk WiFi, journald persisten, dll). Peluangnya kecil mengingat sempitnya margin, tapi tidak merusak |
-
----
+Prosedur lengkap, skrip, contoh hasil tangkapan, dan cara memverifikasi bahwa datanya nyata
+ada di repo terpisah — lihat **Contoh project** di bawah.
 
 ## Bagian 12 — Mengubah kernel bootargs (env U-Boot)
 
@@ -1135,6 +1098,18 @@ Ini contoh yang cocok dengan karakter board — butuh jaringan dan logika di per
 butuh memori. Untuk perbandingan apa yang **tidak** muat di 56 MB (Node.js, Docker, database
 server, Home Assistant *core*), lihat pembahasan di README repo tersebut.
 
+### 2. Kamera CSI (SC3336)
+
+**Repo:** https://github.com/apinblogsite/luckfox_pico_mini_B-Camera
+
+Menjalankan kamera MIPI CSI-2 di image Ubuntu — yang semula saya simpulkan mustahil. Memuat
+tumpukan kamera dengan kompaksi memori lebih dulu dan urutan modul yang benar, lalu menangkap
+frame mentah lewat V4L2.
+
+Berisi analisis `/proc/buddyinfo` sebelum-sesudah kompaksi, tabel kebutuhan buffer per resolusi
+terhadap batas CMA, skrip konversi RAW10 ke gambar, dan cara membuktikan frame yang tertangkap
+benar-benar dari sensor (bukan frame konstan yang ukurannya kebetulan benar).
+
 ## Troubleshooting
 
 | Gejala | Penyebab | Solusi |
@@ -1161,7 +1136,9 @@ server, Home Assistant *core*), lihat pembahasan di README repo tersebut.
 | `usbipd attach` → `no WSL 2 distribution running` | WSL VM mati | Jalankan WSL dulu (10.3) |
 | ADB & RNDIS hilang | USB dalam mode host — memang begitu | Pakai konsol serial (Bagian 7) |
 | Board reset spontan / gagal boot acak / crash saat WiFi aktif | Daya kurang — hub OTG **pasif** tidak menyuplai apa pun | Powered OTG hub atau OTG Y-cable (8.5) |
-| `rkisp: probe of rkisp-vir0 failed with error -12` | `devm_kmalloc` gagal — RAM normal habis, **bukan** CMA | Bagian 11; menaikkan CMA justru memperburuk |
+| `rkisp: probe of rkisp-vir0 failed with error -12` | Fragmentasi memori — `devm_kmalloc` butuh halaman kontigu orde tinggi | `drop_caches` + `compact_memory` sebelum memuat modul (Bagian 11). Menaikkan CMA **tidak** membantu di sini |
+| `vb2_cma_sg_alloc_contiguous: alloc pages fail` saat capture | Buffer capture melebihi CMA (bawaan 1 MB) | Turunkan resolusi, atau naikkan `rk_dma_heap_cma` (Bagian 12) |
+| `rkcif: get_remote_sensor: remote pad is null` | Modul sensor dimuat setelah `video_rkcif` | Muat sensor lebih dulu (Bagian 11) |
 | Ctrl+C tidak masuk ke prompt U-Boot | `bootdelay` nol, tidak ada jendela interupsi | Tulis partisi env langsung (Bagian 12) |
 | `fw_setenv: command not found` | Tidak disertakan di image | Tulis partisi env langsung (Bagian 12) |
 | `plink`/`pscp` gagal: `Cannot confirm a host key in batch mode` | Host key belum ter-cache | Tambah `-hostkey "SHA256:..."` dari pesan errornya |
