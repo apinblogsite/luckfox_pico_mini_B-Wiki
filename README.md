@@ -1148,6 +1148,7 @@ benar-benar dari sensor (bukan frame konstan yang ukurannya kebetulan benar).
 | Load average ~10 tapi CPU 99% idle | Thread `rockit` tersangkut state D menunggu ISP yang gagal probe | Ramping-kan `insmod_ko.sh` (Bagian 13) |
 | `rmmod rockit` menggantung dan tidak bisa dibatalkan | Thread state D tidak dapat diinterupsi | Tidak bisa dilepas saat runtime — cegah saat boot (13.2) |
 | Login serial gagal padahal password benar | Perintah berikutnya termakan sebagai jawaban prompt | Tunggu `login:` lalu `Password:` satu per satu sebelum mengirim |
+| Service `enabled` tapi `inactive (dead)`, `journalctl -b -u` kosong | Siklus ordering systemd — unit `After=` service yang sendirinya `After=multi-user.target` | Ubah ke `After=network.target`; systemd membuang job tanpa pesan error |
 | `Refusing to reload, not enough space available on /run/systemd` saat `apt install` | tmpfs `/run` sempit di board 56 MB | Abaikan — paket dan service tetap terpasang; buat symlink `multi-user.target.wants` manual bila `systemctl enable` ikut gagal |
 | Board statis tidak terjangkau setelah pindah jaringan | Alamat statis terikat satu subnet | Pastikan laptop di SSID yang sama; dongle 2,4 GHz tidak bisa 5 GHz |
 
