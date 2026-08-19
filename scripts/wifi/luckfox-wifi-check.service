@@ -1,0 +1,26 @@
+# Pasang sebagai /etc/systemd/system/luckfox-wifi-check.service
+#
+# Tidak punya seksi [Install]: unit ini dijalankan oleh
+# luckfox-wifi-check.timer, bukan oleh target boot.
+#
+# Sengaja TIDAK memakai Requires= atau BindsTo= terhadap luckfox-wifi.service.
+# Pemeriksa justru harus tetap berjalan ketika layanan WiFi bermasalah -- kalau
+# ia ikut mati bersama yang diawasinya, ia tidak berguna.
+#
+# Juga tidak memakai After=luckfox-wifi.service. Dependensi urutan hanya
+# berlaku di dalam satu transaksi, dan unit ini dipicu timer, bukan bagian dari
+# transaksi boot. Menambahkannya tidak berguna dan hanya menambah risiko siklus
+# ordering -- masalah yang di board ini pernah membuat unit dibuang diam-diam.
+# Waktu mulainya sudah diatur lewat OnBootSec= di timer, dan skripnya sendiri
+# mundur teratur bila layanan sedang dalam keadaan activating.
+
+[Unit]
+Description=Periksa kesehatan WiFi dan pulihkan bila putus
+Documentation=https://github.com/apinblogsite/luckfox_pico_mini_B-Wiki
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/luckfox-wifi-check.sh
+# Pemeriksaan tidak boleh menggantung selamanya dan menahan timer berikutnya.
+TimeoutStartSec=120
+Nice=10

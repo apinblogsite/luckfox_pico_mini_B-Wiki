@@ -1,0 +1,26 @@
+# Pasang sebagai /etc/systemd/system/luckfox-wifi-check.timer, lalu:
+#   sudo systemctl enable --now luckfox-wifi-check.timer
+
+[Unit]
+Description=Jalankan pemeriksa kesehatan WiFi secara berkala
+
+[Timer]
+# Jangan mulai memeriksa terlalu dini. luckfox-wifi.service sendiri menunggu
+# 15 detik lalu bisa memakan sampai 60 detik untuk asosiasi dan alamat, jadi
+# memeriksa sebelum itu hanya menghasilkan kegagalan palsu.
+OnBootSec=3min
+
+# Dihitung dari saat pemeriksaan TERAKHIR SELESAI, bukan dari saat ia mulai.
+# Untuk unit oneshot ini yang benar: OnUnitActiveSec bisa menumpuk kalau satu
+# pemeriksaan kebetulan berjalan lama.
+OnUnitInactiveSec=2min
+
+# Longgarkan presisi supaya systemd boleh menggabungkan bangun timer dengan
+# pekerjaan lain. Pada board satu core ini mengurangi wakeup tanpa biaya --
+# keterlambatan 30 detik sama sekali tidak berarti untuk pemeriksaan 2 menit.
+AccuracySec=30s
+
+Unit=luckfox-wifi-check.service
+
+[Install]
+WantedBy=timers.target

@@ -1,9 +1,10 @@
-# Luckfox Pico Mini B — Flash, Mode Host, WiFi, Konsol Serial & Watchdog
+# Luckfox Pico Mini B — Flash, Mode Host, WiFi, Konsol Serial & Pemulihan Otomatis
 
 Panduan lengkap: menyiapkan WSL2 agar bisa membaca USB SD card reader, mem-flash firmware
 Ubuntu ke microSD, mengakses board via ADB/SSH, mengubah USB ke mode host, memasang dongle
-WiFi USB, mengaktifkan watchdog perangkat keras, dan memperbaiki board secara offline lewat
-kartu SD saat ia tidak bisa diakses.
+WiFi USB, membuat board memulihkan dirinya sendiri dari kernel macet / layanan mati /
+jaringan putus, dan memperbaiki board secara offline lewat kartu SD saat ia tidak bisa
+diakses.
 
 Ditulis berdasarkan proses yang benar-benar dijalankan dan diverifikasi, bukan teori —
 termasuk jalan buntu yang ditemui, supaya tidak diulang.
@@ -23,6 +24,9 @@ scripts/flash.sh                      flash firmware ke SD (O_DIRECT + verifikas
 scripts/wifi/insmod_rtl8188eu.sh      loader driver WiFi
 scripts/wifi/luckfox-wifi-up.sh       penyambung WiFi (statis atau DHCP)
 scripts/wifi/luckfox-wifi.service     unit systemd
+scripts/wifi/luckfox-wifi-check.sh    pemeriksa kesehatan WiFi + pemulihan otomatis
+scripts/wifi/luckfox-wifi-check.service  unit pemeriksa (dipicu timer)
+scripts/wifi/luckfox-wifi-check.timer    jadwal pemeriksaan berkala
 scripts/wifi/setup_wifi.sh            simpan kredensial (PSK sebagai hash)
 scripts/wifi/99-unmanage-wifi.conf    jauhkan NetworkManager dari WiFi
 scripts/trim/insmod_ko_min.sh         loader ramping, lewati tumpukan media
@@ -1439,19 +1443,137 @@ Saat menguji `ssh`, pakai jaring pengaman supaya tidak kehilangan akses kalau ke
 ternyata tidak bekerja — jalankan pembunuhannya dari proses terlepas yang menghidupkan
 kembali sshd bila 12 detik kemudian ia masih mati. Pada uji ini jaring itu tidak terpakai.
 
-### 15.6 Yang masih belum tertutup
+### 15.6 Yang tidak bisa ditutup oleh `Restart=`
 
 **WiFi yang putus setelah unit sukses tidak akan terdeteksi.** Unitnya `oneshot`; setelah
 skripnya selesai dengan status 0, systemd tidak punya proses untuk diawasi. Kalau AP di-reboot
-atau dongle kehilangan asosiasi di tengah jalan, tidak ada yang menyadarinya.
+atau dongle kehilangan asosiasi di tengah jalan, tidak ada yang menyadarinya — dan watchdog
+perangkat keras pun tidak menolong, karena kernelnya baik-baik saja.
 
-`Restart=` tidak bisa memecahkan ini — yang dibutuhkan adalah **pemeriksa berkala**: sebuah
-systemd timer yang memverifikasi asosiasi dan default route, lalu menjalankan ulang
-`luckfox-wifi.service` bila keduanya hilang. Belum diimplementasikan di repo ini.
+Ini ditangani oleh timer pemeriksa di **Bagian 16**.
 
 Untuk layanan yang programnya sendiri bisa melapor sehat, ada juga `WatchdogSec=` per unit
 dengan `sd_notify(WATCHDOG=1)` — lebih tajam daripada sekadar "prosesnya masih hidup", tapi
-menuntut perubahan pada programnya.
+menuntut perubahan pada programnya. Belum dipakai di repo ini.
+
+---
+
+## Bagian 16 — Timer pemeriksa WiFi
+
+Lapisan terakhir. Bagian 14 memulihkan kernel yang macet, Bagian 15 memulihkan layanan yang
+mati, dan bagian ini memulihkan **jaringan yang putus diam-diam** — satu-satunya kegagalan
+yang membuat board tidak terjangkau padahal semuanya masih berjalan normal.
+
+```bash
+sudo install -m 755 scripts/wifi/luckfox-wifi-check.sh /usr/local/sbin/
+sudo install -m 644 scripts/wifi/luckfox-wifi-check.service /etc/systemd/system/
+sudo install -m 644 scripts/wifi/luckfox-wifi-check.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now luckfox-wifi-check.timer
+```
+
+### 16.1 Apa yang diperiksa
+
+Berlapis, dari yang paling murah ke yang paling meyakinkan:
+
+| # | Pemeriksaan | Biaya |
+|---:|---|---|
+| 1 | interface wireless ada | gratis |
+| 2 | `carrier` menyala | gratis |
+| 3 | `wpa_state=COMPLETED` | gratis |
+| 4 | punya alamat IPv4 | gratis |
+| 5 | ada default route, dan route itu keluar lewat interface wireless | gratis |
+| 6 | gateway menjawab ping | 3 paket ICMP lokal |
+
+Pemeriksaan berhenti di kegagalan pertama, jadi kondisi sehat hampir tidak berbiaya. Langkah 6
+sengaja hanya menyentuh **gateway lokal**, bukan internet — supaya pemeriksa tidak
+melaporkan WiFi sakit gara-gara ISP Anda sedang bermasalah.
+
+### 16.2 `ping -I` tidak ada di board ini
+
+Jebakan yang langsung memakan korban saat pertama dipasang. `ping` di image ini adalah
+**GNU inetutils 2.2**, bukan iputils, dan ia tidak mengenal `-I`:
+
+```
+ping: invalid option -- 'I'
+```
+
+Perintahnya gagal karena opsi tidak valid, lalu skrip menyimpulkan gateway tidak menjawab.
+Gejalanya jahat: pemeriksaan gagal terus-menerus pada jaringan yang **sepenuhnya sehat**
+(gateway terukur 2,7 ms, internet 36 ms), dan pemeriksa yang seharusnya memulihkan justru
+menjadi sumber gangguan yang menjalankan ulang WiFi tiap beberapa menit.
+
+Pengikatan ke interface memang tidak diperlukan: alamat gateway diambil dari default route,
+dan langkah 5 sudah memastikan route itu keluar lewat interface wireless.
+
+Periksa lebih dulu di board Anda:
+
+```bash
+ping -V | head -1
+```
+
+### 16.3 Satu kegagalan bukan berarti putus
+
+Skrip menghitung kegagalan **berurutan** di `/run` (tmpfs — tidak membebani kartu SD) dan baru
+bertindak setelah `RESTART_AFTER=2`. Hitungan direset begitu sehat kembali. Tanpa ini, satu
+ping yang meleset sudah cukup untuk memicu pemulihan yang tidak perlu.
+
+### 16.4 `wpa_supplicant` tersangkut harus dibunuh dulu
+
+Bagian pemulihan yang paling mudah salah. `luckfox-wifi-up.sh` memeriksa:
+
+```sh
+if pgrep -f "wpa_supplicant.*$IF" >/dev/null 2>&1; then
+	echo "wpa_supplicant sudah jalan"
+```
+
+Kalau `wpa_supplicant` masih hidup tapi asosiasinya tersangkut, skrip melihat prosesnya ada,
+menyimpulkan "sudah jalan", dan keluar **tanpa memperbaiki apa pun**. Artinya
+`systemctl restart luckfox-wifi.service` saja tidak berefek pada kasus yang justru paling
+sering terjadi.
+
+Karena itu pemeriksa mematikan `wpa_supplicant` lebih dulu bila `wpa_state` bukan `COMPLETED`,
+baru menjalankan ulang layanan.
+
+### 16.5 Diuji dengan memutus WiFi sungguhan
+
+`wpa_supplicant` dibunuh dari proses terlepas, lalu pemulihan dipantau dari laptop:
+
+```
+23:49:09  wpa_supplicant dibunuh
+23:49:10  pemeriksaan gagal (1): carrier turun pada wlx6c4cbc88e05a
+23:51:26  pemeriksaan gagal (2): carrier turun -> menjalankan ulang luckfox-wifi.service
+23:51:45  terasosiasi lagi, alamat 192.168.8.139/24, gateway 192.168.8.1
+```
+
+Dari sisi laptop: board hilang pada detik ke-10 dan kembali pada detik ke-159 — **149 detik
+mati, pulih sepenuhnya tanpa campur tangan**.
+
+Kegagalan tertangkap di langkah 2 dalam waktu satu detik setelah timer berdetak. Sisa waktunya
+adalah konsekuensi desain yang disengaja: periode timer 2 menit dikali ambang 2 kegagalan
+berurutan. Kalau Anda butuh pemulihan lebih cepat, perpendek `OnUnitInactiveSec=` atau turunkan
+`RESTART_AFTER` ke 1 — dengan konsekuensi lebih rentan bereaksi terhadap gangguan sesaat.
+
+Saat menguji, pakai jaring pengaman yang memulihkan manual bila 10 menit berlalu tanpa
+perbaikan. Pada uji ini jaring itu tidak terpakai.
+
+### 16.6 Reboot otomatis sengaja dimatikan
+
+Skrip punya `REBOOT_AFTER`, tapi bawaannya **0 alias tidak pernah**. Alasannya: kalau AP Anda
+mati berjam-jam, board akan reboot berulang tanpa guna dan hanya memperpendek umur kartu SD.
+
+Aktifkan (misalnya `10`, berarti sekitar 20 menit gagal terus) hanya kalau board dipasang di
+tempat yang sulit dijangkau **dan** jaringannya biasanya andal.
+
+### 16.7 Tiga lapisan pemulihan
+
+| Lapisan | Menangkap | Waktu pulih |
+|---|---|---|
+| Watchdog perangkat keras (14) | kernel macet, CPU dikuasai habis | ~44 dtk + boot |
+| Kebijakan restart (15) | proses layanan mati atau gagal start | 5–20 dtk |
+| Timer pemeriksa (16) | jaringan putus diam-diam | ~2,5 menit |
+
+Ketiganya sudah diuji dengan memicu kegagalan sungguhan, bukan dengan membaca konfigurasi.
 
 ---
 
@@ -1531,6 +1653,9 @@ benar-benar dari sensor (bukan frame konstan yang ukurannya kebetulan benar).
 | `Refusing to reload, not enough space available on /run/systemd` saat `apt install` | `/run` hanya 8,3 MB, lebih kecil dari cadangan 16 MB yang disyaratkan — jadi tidak akan pernah cukup | `sudo mount -o remount,size=24M /run` lalu pasang `run-resize.service` agar bertahan (15.1). `size` tmpfs hanya batas, bukan alokasi |
 | Layanan `Restart=on-failure` tidak pernah dicoba ulang | Skripnya keluar dengan status 0 pada kegagalan | Perbaiki kode keluar skripnya dulu — kebijakan restart tidak berguna tanpa itu (15.2) |
 | Layanan menyerah permanen setelah beberapa kali gagal | `RestartSec` bawaan 100 ms menghabiskan jatah 5 start dalam <1 detik | `StartLimitIntervalSec=0` + `RestartSec` yang wajar (15.3) |
+| `ping: invalid option -- 'I'` | `ping` di image ini GNU inetutils 2.2, bukan iputils — tidak mendukung `-I` | Hilangkan `-I`; pastikan default route sudah lewat interface yang benar (16.2) |
+| Board diam-diam tidak terjangkau padahal layanan jalan normal | WiFi putus setelah unit `oneshot` sukses; tidak ada proses yang diawasi systemd | Pasang timer pemeriksa (Bagian 16) |
+| `systemctl restart luckfox-wifi` tidak memperbaiki asosiasi yang tersangkut | Skrip melihat `wpa_supplicant` masih hidup lalu keluar tanpa berbuat apa-apa | Bunuh `wpa_supplicant` dulu sebelum restart (16.4) |
 | Board statis tidak terjangkau setelah pindah jaringan | Alamat statis terikat satu subnet | Pastikan laptop di SSID yang sama; dongle 2,4 GHz tidak bisa 5 GHz |
 | Drop-in systemd diabaikan diam-diam, `Assignment outside of section` | Berkas `.conf` tanpa header seksi | Tambah `[Manager]` (system.conf) atau `[Journal]` (journald.conf) di baris pertama (14.5) |
 | `daemon-reexec` ditolak: `not enough space available on /run/systemd` | `/run` hanya 8,3 MB, systemd mensyaratkan cadangan 16 MB | Tidak bisa diakali — terapkan `system.conf` lewat reboot (14.5) |
