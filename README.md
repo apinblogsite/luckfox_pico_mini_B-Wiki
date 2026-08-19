@@ -1,8 +1,9 @@
-# Luckfox Pico Mini B — Flash, Mode Host, WiFi & Konsol Serial
+# Luckfox Pico Mini B — Flash, Mode Host, WiFi, Konsol Serial & Watchdog
 
 Panduan lengkap: menyiapkan WSL2 agar bisa membaca USB SD card reader, mem-flash firmware
 Ubuntu ke microSD, mengakses board via ADB/SSH, mengubah USB ke mode host, memasang dongle
-WiFi USB, dan memperbaiki board secara offline lewat kartu SD saat ia tidak bisa diakses.
+WiFi USB, mengaktifkan watchdog perangkat keras, dan memperbaiki board secara offline lewat
+kartu SD saat ia tidak bisa diakses.
 
 Ditulis berdasarkan proses yang benar-benar dijalankan dan diverifikasi, bukan teori —
 termasuk jalan buntu yang ditemui, supaya tidak diulang.
@@ -26,6 +27,10 @@ scripts/wifi/setup_wifi.sh            simpan kredensial (PSK sebagai hash)
 scripts/wifi/99-unmanage-wifi.conf    jauhkan NetworkManager dari WiFi
 scripts/trim/insmod_ko_min.sh         loader ramping, lewati tumpukan media
 scripts/uboot/patch_bootargs.py       ubah bootargs + hitung ulang CRC32 env
+scripts/watchdog/watchdog-overlay.dts overlay DT penambah node watchdog
+scripts/watchdog/apply_watchdog_dt.sh terapkan overlay ke partisi boot (di board)
+scripts/watchdog/10-watchdog.conf     drop-in systemd pengaktif watchdog
+scripts/watchdog/test_watchdog.sh     uji macet sungguhan + bukti pemulihan
 scripts/recovery/mount_sdcard.sh      mount partisi board offline dari WSL
 tools/serial-console.ps1              akses konsol serial dari Windows
 ```
@@ -1061,6 +1066,16 @@ printf "[Journal]\nStorage=volatile\nRuntimeMaxUse=2M\n" | \
   sudo tee /etc/systemd/journald.conf.d/99-volatile.conf
 ```
 
+**`Storage=volatile` tidak membersihkan yang sudah terlanjur ada.** Setelan itu hanya
+menghentikan penulisan baru ke `/var/log/journal`; berkas lama tetap tergeletak di sana
+dan tetap dihitung `journalctl --disk-usage`. Pada board ini sisa itu sempat menumpuk
+**417 MB** sebelum ketahuan. Bersihkan sekali setelah mengaktifkan volatile:
+
+```bash
+journalctl --disk-usage          # cek dulu berapa yang tertinggal
+sudo journalctl --vacuum-size=32M
+```
+
 ### 13.5 Hasilnya
 
 | Metrik | Sebelum | Sesudah |
@@ -1073,6 +1088,231 @@ printf "[Journal]\nStorage=volatile\nRuntimeMaxUse=2M\n" | \
 
 Selisih ~12 MB `MemAvailable` itu besar pada board 56 MB — kira-kira sepertiga ruang kerja
 yang tadinya terbuang.
+
+---
+
+## Bagian 14 — Watchdog perangkat keras
+
+Sepanjang pengerjaan repo ini board beberapa kali menggantung total dan satu-satunya jalan
+keluar adalah mencabut daya. Watchdog perangkat keras menghapus keharusan itu: kalau sistem
+berhenti merespons, SoC mereset dirinya sendiri.
+
+Hasil akhirnya sudah **diuji dengan membuat board benar-benar macet**, bukan sekadar dibaca
+dari konfigurasi. Lihat 14.5.
+
+### 14.1 Nodenya tidak ada di DTB — bukan sekadar disabled
+
+Driver `dw_wdt` sudah ada di dalam kernel (built-in, bukan modul), tapi `/dev/watchdog` tidak
+pernah muncul. Penyebabnya bukan driver, melainkan device tree. Pemeriksaan pada DTB aktif:
+
+| Yang dicari | Hasil |
+|---|---:|
+| Total node | 254 |
+| Node dengan `status = "disabled"` | 31 |
+| Kemunculan `wdt` / `dw-wdt` / `ff5a0000` | **0** |
+
+Jadi nodenya bukan dinonaktifkan — ia tidak ada sama sekali. Ini penting karena mengubah
+solusinya: `status = "okay"` saja tidak akan berbuat apa-apa; nodenya harus ditambahkan.
+
+Yang membingungkan, `rv1106.dtsi` di SDK **memuat** node itu (dengan `status = "disabled"`)
+pada baris 1107, dan rantai include `rv1103g-luckfox-pico-mini.dts` → `rv1103.dtsi` →
+`rv1106.dtsi` tidak punya `delete-node` di mana pun. Kesimpulan yang tersisa: DTB yang
+dikirim bersama firmware dibangun dari sumber yang berbeda dari SDK publik.
+
+### 14.2 Menyusun nodenya
+
+Nilai-nilai yang dibutuhkan dan dari mana asalnya:
+
+| Properti | Nilai | Sumber |
+|---|---|---|
+| `reg` | `<0xff5a0000 0x100>` | `rv1106.dtsi` |
+| phandle `cru` | `0x02` | dibaca dari DTB aktif |
+| `TCLK_WDT_NS` | `106` = `0x6a` | `dt-bindings/clock/rv1106-cru.h` |
+| `PCLK_WDT_NS` | `105` = `0x69` | idem |
+| `interrupts` | `<0x00 0x2e 0x04>` | `GIC_SPI 46 IRQ_TYPE_LEVEL_HIGH` |
+
+Overlay lengkapnya ada di `scripts/watchdog/watchdog-overlay.dts`.
+
+`dtc` memberi peringatan `Missing interrupt-parent` dan `cell 0 is not a phandle reference`.
+Keduanya ternyata tidak fatal — `interrupt-parent` diwarisi dari node root, dan phandle yang
+ditulis sebagai angka mentah tetap sah. Buktinya terlihat setelah boot, di
+`/sys/kernel/debug/clk/clk_summary`:
+
+```
+tclk_wdt_ns    1  1  0   24000000
+pclk_wdt_ns    1  1  0  100000000
+```
+
+Cacah pemakaian dan cacah aktif keduanya `1` — driver benar-benar mengambil dan menghidupkan
+clock yang ditunjuk. Kalau ID clocknya salah, angka-angka ini akan nol.
+
+### 14.3 Ruang FDT sangat sempit — hitung sebelum menulis
+
+Partisi boot `/dev/mmcblk1p4` berisi FIT image:
+
+```
+offset 0        header FIT           2048 byte
+offset 2048     device tree kernel   <-- yang diubah
+offset 38400    image kernel
+```
+
+Artinya FDT punya batas keras **36352 byte**. Melewatinya berarti menimpa awal kernel dan
+board tidak akan boot lagi.
+
+```
+FDT sebelum   36054 byte
+FDT sesudah   36242 byte
+batas         36352 byte
+sisa            110 byte
+```
+
+Sisa 110 byte itu tipis. Jangan menambah properti lain ke DTB ini tanpa menghitung ulang.
+`apply_watchdog_dt.sh` melakukan uji coba pada salinan lebih dulu dan menolak menulis kalau
+tidak muat.
+
+**Cadangkan partisi boot sebelum menjalankannya.** Kalau board gagal boot, tulis balik
+cadangan itu ke offset 819200 pada kartu SD secara offline (Bagian 10).
+
+```bash
+sudo sh scripts/watchdog/apply_watchdog_dt.sh
+sudo reboot
+```
+
+Setelah boot:
+
+```
+$ ls -l /dev/watchdog*
+crw------- 1 root root  10, 130 /dev/watchdog
+crw------- 1 root root 248,   0 /dev/watchdog0
+
+$ ls -l /sys/bus/platform/drivers/dw_wdt/
+ff5a0000.watchdog -> ../../../../devices/platform/ff5a0000.watchdog
+```
+
+### 14.4 Sifat perangkat kerasnya
+
+Dibaca lewat ioctl (`/sys/class/watchdog/watchdog0/` kosong karena
+`CONFIG_WATCHDOG_SYSFS` tidak diaktifkan di kernel ini — jalur ioctl yang dipakai systemd
+tetap bekerja):
+
+```
+identity   : Synopsys DesignWare Watchdog
+options    : 0x00008380   KEEPALIVEPING | CARDRESET | MAGICCLOSE | SETTIMEOUT
+timeout    : 44 detik (bawaan)
+bootstatus : 0x00000000
+```
+
+**Timeout hanya menerima nilai berjenjang.** Diukur dengan menyetel lalu membaca ulang:
+
+| Diminta | Diberikan |
+|---:|---:|
+| 5 | 5 |
+| 10 | 11 |
+| 15, 20 | 22 |
+| 30, 44 | 44 |
+| 60 | 89 |
+| 90, 120, 180 | apa adanya |
+
+Jenjang 5/11/22/44/89 itu pembagi pangkat dua dari pencacah DesignWare. Nilai di atas 89
+dilaporkan persis seperti yang diminta, yang mengesankan perpanjangan lewat perangkat lunak —
+karena itu kurang bisa dipercaya untuk menangkap macet keras. **Pakai nilai native.**
+
+**Watchdog ini tidak bisa benar-benar dimatikan, dan itu justru bagus.** Node kita tidak punya
+properti `resets` (mengikuti `rv1106.dtsi`). Tanpa reset control, `dw_wdt_stop()` tidak dapat
+menghentikan perangkat keras, sehingga driver menandai `WDOG_HW_RUNNING` dan kernel thread
+`watchdogd` mengambil alih pemberian makan begitu userspace melepas perangkat:
+
+```
+$ ps -eo pid,stat,comm | grep watchdogd
+   31 S    watchdogd
+```
+
+Konsekuensinya: membuka lalu menutup `/dev/watchdog` tidak akan membuat board mati mendadak.
+Kernel menjaganya selama ia masih hidup.
+
+### 14.5 Menyerahkan watchdog ke systemd
+
+Pasang `scripts/watchdog/10-watchdog.conf` sebagai
+`/etc/systemd/system.conf.d/10-watchdog.conf`, lalu **reboot**.
+
+Dua jebakan yang keduanya sempat menjegal di sini:
+
+**Header `[Manager]` wajib ada.** Tanpa itu systemd membaca berkasnya lalu membuang setiap
+baris, dan satu-satunya tanda adalah pesan yang mudah terlewat di jurnal:
+
+```
+/etc/systemd/system.conf.d/10-watchdog.conf:8: Assignment outside of section. Ignoring.
+```
+
+`RuntimeWatchdogUSec` tetap `0` tanpa gejala lain — tidak ada error, tidak ada layanan gagal.
+
+**`systemctl daemon-reexec` tidak akan pernah berhasil di board ini:**
+
+```
+Refusing to reexecute, not enough space available on /run/systemd.
+Currently, 5.8M are free, but a safety buffer of 16.0M is enforced.
+```
+
+`/run` adalah tmpfs 8,3 MB (proporsional terhadap RAM 42 MB), jadi syarat 16 MB itu mustahil
+dipenuhi bahkan saat `/run` kosong. Penerapan harus lewat reboot.
+
+Verifikasi setelah boot:
+
+```
+$ systemctl show -p RuntimeWatchdogUSec
+RuntimeWatchdogUSec=44s
+
+$ sudo ls -l /proc/1/fd/ | grep watchdog
+l-wx------ 1 root root 64 9 -> /dev/watchdog
+```
+
+Membaca ulang `/dev/watchdog` dari proses lain akan gagal dengan `Device or resource busy` —
+itu bukan masalah, justru bukti systemd sudah memegangnya secara eksklusif.
+
+### 14.6 Ujinya: bikin board macet sungguhan
+
+Konfigurasi yang benar belum berarti perangkat kerasnya bekerja. Satu-satunya bukti adalah
+membuat board macet dan melihatnya pulih sendiri.
+
+RV1103 berinti tunggal, jadi satu proses `SCHED_FIFO` prioritas 99 cukup untuk menguasai
+seluruh CPU. Tapi ada satu detail yang menentukan: secara bawaan kernel mengembalikan 5%
+waktu CPU kepada tugas non-RT (`sched_rt_runtime_us=950000`), dan jatah sekecil itu sudah
+lebih dari cukup bagi PID 1 untuk terus memberi makan watchdog — ujinya tidak akan memicu
+apa pun. RT throttling harus dimatikan lebih dulu.
+
+```bash
+sudo sh scripts/watchdog/test_watchdog.sh
+```
+
+> Jalankan hanya kalau board bisa dicabut dayanya secara fisik. Kalau watchdog ternyata
+> tidak aktif, board menggantung total.
+
+**Hasil terukur:** board berhenti merespons, lalu mereset diri dan kembali online. Empat
+bukti bahwa itu reset perangkat keras sungguhan, bukan reboot rapi:
+
+| Bukti | Bacaan |
+|---|---|
+| `uptime` | terhitung ulang dari nol tanpa perintah reboot |
+| `pgrep -af spin.sh` | proses lenyap |
+| `sched_rt_runtime_us` | kembali `950000` (nilai `-1` tidak persisten) |
+| `dmesg` | `EXT4-fs (mmcblk1p7): recovery complete` |
+
+Yang terakhir itu buktinya yang paling kuat — jurnal ext4 hanya diputar ulang setelah
+shutdown tidak bersih.
+
+Setelah pulih, systemd langsung mengambil watchdog kembali dan ketiga layanan
+(`luckfox-wifi`, `mosquitto`, `luckfox-telemetry`) aktif sendiri tanpa campur tangan.
+
+### 14.7 Batasnya
+
+Watchdog ini menangkap **kernel macet** dan **CPU dikuasai habis**. Ia tidak menangkap
+kondisi di mana kernel masih sehat tapi layanan Anda yang mati — untuk itu pakai
+`Restart=on-failure` pada unit systemd, atau `WatchdogSec=` per layanan bila programnya
+mengirim `sd_notify(WATCHDOG=1)`.
+
+Perlu diingat juga bahwa `bootstatus` selalu terbaca `0x00000000` pada board ini, jadi
+sesudah reset tidak ada cara langsung menanyakan "apakah tadi watchdog yang mereset?".
+Kalau perlu membedakannya, catat penanda ke disk saat shutdown bersih dan periksa saat boot.
 
 ---
 
@@ -1151,6 +1391,10 @@ benar-benar dari sensor (bukan frame konstan yang ukurannya kebetulan benar).
 | Service `enabled` tapi `inactive (dead)`, `journalctl -b -u` kosong | Siklus ordering systemd — unit `After=` service yang sendirinya `After=multi-user.target` | Ubah ke `After=network.target`; systemd membuang job tanpa pesan error |
 | `Refusing to reload, not enough space available on /run/systemd` saat `apt install` | tmpfs `/run` sempit di board 56 MB | Abaikan — paket dan service tetap terpasang; buat symlink `multi-user.target.wants` manual bila `systemctl enable` ikut gagal |
 | Board statis tidak terjangkau setelah pindah jaringan | Alamat statis terikat satu subnet | Pastikan laptop di SSID yang sama; dongle 2,4 GHz tidak bisa 5 GHz |
+| Drop-in systemd diabaikan diam-diam, `Assignment outside of section` | Berkas `.conf` tanpa header seksi | Tambah `[Manager]` (system.conf) atau `[Journal]` (journald.conf) di baris pertama (14.5) |
+| `daemon-reexec` ditolak: `not enough space available on /run/systemd` | `/run` hanya 8,3 MB, systemd mensyaratkan cadangan 16 MB | Tidak bisa diakali — terapkan `system.conf` lewat reboot (14.5) |
+| `/dev/watchdog` tidak muncul padahal `dw_wdt` ada di kernel | Node watchdog tidak ada di DTB — bukan disabled | Tambahkan nodenya lewat overlay (14.1) |
+| `journalctl --disk-usage` ratusan MB padahal `Storage=volatile` | Berkas lama di `/var/log/journal` tetap tertinggal | `journalctl --vacuum-size=32M` sekali setelah mengaktifkan volatile (13.4) |
 
 ## Catatan RAM
 
@@ -1158,8 +1402,10 @@ Board hanya punya **56 MB** total dengan ~34 MB available. Hindari `apt upgrade`
 paket sekaligus — `dpkg` rakus memori dan berisiko OOM. Kalau perlu, lakukan bertahap per
 kelompok kecil.
 
-Boot arg `rk_dma_heap_cma=1M` sudah aktif di image ini, jadi alokasi CMA 24 MB yang biasa
-memakan RAM sudah ditekan.
+Boot arg `rk_dma_heap_cma=1M` sudah aktif di image bawaan, jadi alokasi CMA 24 MB yang biasa
+memakan RAM sudah ditekan. Board ini sekarang berjalan dengan `rk_dma_heap_cma=16M` karena
+capture kamera resolusi penuh membutuhkannya (Bagian 11 dan 12); harganya `MemTotal` turun
+dari ~56 MB menjadi **42 MB**. Kalau kamera tidak dipakai, kembalikan ke `1M`.
 
 Load average tinggi yang dulu membingungkan **sudah terpecahkan** — sepuluh thread `rockit` di
 state D, lihat Bagian 13. Setelah tumpukan media tidak dimuat, load idle turun ke 0,3–0,5.
@@ -1173,6 +1419,7 @@ Sebelumnya `MemFree` bisa turun ke 1 MB — itu yang membuat alokasi besar seper
 | File | Isi |
 |---|---|
 | `backup/boot_p4_before_host.bin` | Partisi boot sebelum diubah ke mode host — kembalikan ke offset 819200 untuk balik ke peripheral |
+| `backup/boot_p4_before_wdt.bin` | Partisi boot sebelum node watchdog ditambahkan — pemulihan kalau DTB rusak (Bagian 14) |
 | `backup/env_p1_original.bin` | Partisi env asli (`rk_dma_heap_cma=1M`) — tulis ke `/dev/mmcblk1p1` kalau bootargs rusak |
 | `Ubuntu_Luckfox_Pico_Mini_B_MicroSD_250313.zip` | Firmware asli, untuk flash ulang total |
 | `/oem/usr/ko/*.bak`, `/etc/init.d/S50usbdevice.bak` | Versi asli skrip yang dimodifikasi |

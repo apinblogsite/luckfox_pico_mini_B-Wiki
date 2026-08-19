@@ -1,0 +1,55 @@
+/*
+ * Overlay device tree: mengaktifkan watchdog perangkat keras RV1106.
+ *
+ * KENAPA overlay dan bukan sekadar mengubah status jadi "okay":
+ * DTB yang dikirim bersama firmware Luckfox TIDAK memuat node watchdog sama
+ * sekali. Bukan disabled -- benar-benar tidak ada. Pemeriksaan pada DTB aktif:
+ *
+ *   254 node total, 31 di antaranya masih menyimpan status = "disabled",
+ *   tapi nol kemunculan untuk "wdt", "dw-wdt", maupun "ff5a0000".
+ *
+ * Padahal rv1106.dtsi di SDK memuat node itu (dengan status "disabled") dan
+ * rantai include rv1103g-luckfox-pico-mini.dts -> rv1103.dtsi -> rv1106.dtsi
+ * tidak punya delete-node di mana pun. Artinya DTB yang beredar dibangun dari
+ * sumber yang berbeda. Jadi node-nya harus ditambahkan, bukan diaktifkan.
+ *
+ * Driver dw_wdt sendiri sudah ada di dalam kernel (built-in, bukan modul),
+ * jadi tidak perlu kompilasi apa pun.
+ *
+ * ASAL NILAI-NILAI DI BAWAH:
+ *   reg        0xff5a0000 ukuran 0x100  -- dari rv1106.dtsi
+ *   clocks     <cru TCLK_WDT_NS>, <cru PCLK_WDT_NS>
+ *              phandle cru = 0x02 (dibaca dari DTB aktif)
+ *              TCLK_WDT_NS = 106 = 0x6a, PCLK_WDT_NS = 105 = 0x69
+ *              (dari include/dt-bindings/clock/rv1106-cru.h)
+ *   interrupts <GIC_SPI 46 IRQ_TYPE_LEVEL_HIGH> = <0x00 0x2e 0x04>
+ *
+ * CATATAN properti "resets" sengaja TIDAK disertakan, mengikuti rv1106.dtsi.
+ * Konsekuensinya nyata dan justru menguntungkan: tanpa reset control,
+ * dw_wdt_stop() tidak bisa benar-benar menghentikan perangkat keras, sehingga
+ * driver menandai WDOG_HW_RUNNING dan kernel thread "watchdogd" yang mengambil
+ * alih pemberian makan begitu userspace melepas /dev/watchdog. Board karena itu
+ * tidak akan reset mendadak hanya gara-gara sebuah program menutup perangkat.
+ *
+ * PERINGATAN RUANG: FDT di partisi boot punya batas keras. Lihat
+ * apply_watchdog_dt.sh -- selalu hitung dulu sebelum menulis.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/";
+		__overlay__ {
+			watchdog@ff5a0000 {
+				compatible = "rockchip,rv1106-wdt", "snps,dw-wdt";
+				reg = <0xff5a0000 0x100>;
+				clocks = <0x02 0x6a>, <0x02 0x69>;
+				clock-names = "tclk", "pclk";
+				interrupts = <0x00 0x2e 0x04>;
+				status = "okay";
+			};
+		};
+	};
+};
