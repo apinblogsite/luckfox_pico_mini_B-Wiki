@@ -31,6 +31,9 @@ scripts/watchdog/watchdog-overlay.dts overlay DT penambah node watchdog
 scripts/watchdog/apply_watchdog_dt.sh terapkan overlay ke partisi boot (di board)
 scripts/watchdog/10-watchdog.conf     drop-in systemd pengaktif watchdog
 scripts/watchdog/test_watchdog.sh     uji macet sungguhan + bukti pemulihan
+scripts/systemd/install_restart_policies.sh  pasang kebijakan restart + perbaikan /run
+scripts/systemd/run-resize.service    perbesar /run agar daemon-reload bisa jalan
+scripts/systemd/*-10-restart.conf     drop-in Restart= per layanan
 scripts/recovery/mount_sdcard.sh      mount partisi board offline dari WSL
 tools/serial-console.ps1              akses konsol serial dari Windows
 ```
@@ -1306,13 +1309,149 @@ Setelah pulih, systemd langsung mengambil watchdog kembali dan ketiga layanan
 ### 14.7 Batasnya
 
 Watchdog ini menangkap **kernel macet** dan **CPU dikuasai habis**. Ia tidak menangkap
-kondisi di mana kernel masih sehat tapi layanan Anda yang mati — untuk itu pakai
-`Restart=on-failure` pada unit systemd, atau `WatchdogSec=` per layanan bila programnya
-mengirim `sd_notify(WATCHDOG=1)`.
+kondisi di mana kernel masih sehat tapi layanan Anda yang mati — lapisan itu ditangani
+kebijakan restart di **Bagian 15**.
 
 Perlu diingat juga bahwa `bootstatus` selalu terbaca `0x00000000` pada board ini, jadi
 sesudah reset tidak ada cara langsung menanyakan "apakah tadi watchdog yang mereset?".
 Kalau perlu membedakannya, catat penanda ke disk saat shutdown bersih dan periksa saat boot.
+
+---
+
+## Bagian 15 — Kebijakan restart layanan
+
+Watchdog di Bagian 14 menangkap kernel macet dan CPU yang dikuasai habis. Ia **tidak**
+menangkap kondisi di mana kernel sehat tapi sebuah layanan mati. Bagian ini menutup lapisan
+itu.
+
+### 15.1 Prasyarat: `/run` terlalu kecil untuk `daemon-reload`
+
+Sebelum apa pun bisa diterapkan, ada penghalang yang sudah berkali-kali muncul di board ini:
+
+```
+Refusing to reload, not enough space available on /run/systemd.
+Currently, 5.8M are free, but a safety buffer of 16.0M is enforced.
+```
+
+`/run` adalah tmpfs seukuran 10% RAM — **8,3 MB** pada board 42 MB. Karena 8,3 MB sendiri
+lebih kecil dari cadangan 16 MB yang disyaratkan, syarat itu **tidak akan pernah terpenuhi,
+bahkan saat `/run` kosong**. Konsekuensinya setiap perubahan unit systemd hanya bisa
+diterapkan lewat reboot, dan `systemctl enable` saat `apt install` ikut gagal.
+
+Perbaikannya murah karena `size` pada tmpfs adalah **batas atas, bukan alokasi** — RAM baru
+terpakai kalau benar-benar ditulisi:
+
+```bash
+sudo mount -o remount,size=24M /run
+```
+
+Terukur: `MemAvailable` hanya bergeser dari 21 MB ke 20 MB, sementara pemakaian nyata `/run`
+tetap ~2 MB. Setelah itu `daemon-reload` langsung berhasil.
+
+Agar bertahan setelah reboot, pasang `scripts/systemd/run-resize.service` lalu
+`systemctl enable run-resize.service`.
+
+### 15.2 `Restart=on-failure` tidak berguna kalau kode keluarnya bohong
+
+Ini temuan terpenting di bagian ini. `luckfox-wifi-up.sh` versi pertama keluar dengan
+status **0** pada hampir semua kegagalan nyata:
+
+| Kondisi | Kode keluar lama | Yang systemd simpulkan |
+|---|:---:|---|
+| Config wpa_supplicant tidak ada | 0 | sukses |
+| Tidak ada interface wireless | 0 | sukses |
+| Asosiasi gagal setelah 30 detik | 0 | sukses |
+| `wpa_supplicant` gagal dijalankan | 1 | gagal |
+
+Dari empat kegagalan, hanya satu yang terlihat sebagai kegagalan. Yang paling mungkin terjadi
+di dunia nyata — dongle USB terlambat enumerasi, atau AP belum siap saat board boot — justru
+dilaporkan sukses. Memasang `Restart=on-failure` di atas skrip seperti itu menghasilkan
+kebijakan yang tidak akan pernah terpicu.
+
+Lebih buruk lagi, pada kasus asosiasi gagal skrip **tetap melanjutkan** memasang alamat statis
+pada interface yang tidak terhubung, lalu melaporkan "selesai".
+
+Skrip sekarang memakai semantik yang jelas:
+
+```
+keluar 0 = tidak ada yang perlu dikerjakan (WiFi memang tidak dikonfigurasi)
+keluar 1 = gagal, dan mencoba lagi masuk akal
+```
+
+dan memverifikasi hasil akhirnya alih-alih menganggap perintah sebelumnya pasti berhasil:
+
+```sh
+ADDR=$(ip -4 -o addr show "$IF" | awk "{print \$4}" | head -1)
+GW=$(ip route | awk "/^default/{print \$3; exit}")
+[ -n "$ADDR" ] || { echo "interface tidak mendapat alamat IPv4" >&2; exit 1; }
+[ -n "$GW" ]   || { echo "tidak ada default route" >&2; exit 1; }
+```
+
+Diuji dengan menjalankan salinan skrip yang deteksi interfacenya sengaja dibuat tidak pernah
+cocok:
+
+```
+kode keluar: 1
+keluaran   : tidak ada interface wireless setelah 30 detik
+```
+
+### 15.3 `RestartSec` bawaan 100 ms adalah jebakan
+
+Unit bawaan distro untuk `mosquitto` dan `ssh` sudah memakai `Restart=on-failure`, jadi
+sekilas tidak perlu disentuh. Tapi keduanya memakai `RestartSec` bawaan **100 ms**, sementara
+batas bawaan adalah 5 start dalam 10 detik.
+
+Artinya: kalau layanan gagal berulang saat start, jatah lima percobaan habis dalam **kurang
+dari satu detik**, lalu systemd menyerah permanen. Persis pada kegagalan yang paling perlu
+ditolong, kebijakan bawaan paling cepat menyerah.
+
+Karena itu semua unit di sini memakai `StartLimitIntervalSec=0` (matikan pembatasan laju) dan
+`RestartSec` yang masuk akal.
+
+### 15.4 Kebijakan yang dipasang
+
+```bash
+sudo sh scripts/systemd/install_restart_policies.sh
+```
+
+| Layanan | Restart | RestartSec | Alasan |
+|---|---|---:|---|
+| `luckfox-wifi` | `on-failure` | 20s | Mencoba ulang start yang gagal. `always` tidak cocok — unit `oneshot` yang sukses memang seharusnya berhenti |
+| `luckfox-telemetry` | `always` | 10s | Sudah ada di unitnya; hanya perlu pembatasan laju dimatikan |
+| `mosquitto` | `always` | 5s | `always` juga menangkap keluar-dengan-status-0 yang tak terduga |
+| `ssh` | `on-failure` | 5s | Sengaja **tidak** `always` — unit bawaan memasang `RestartPreventExitStatus=255`, kode sshd untuk konfigurasi rusak |
+
+Keempatnya `StartLimitIntervalSec=0`.
+
+### 15.5 Diuji dengan benar-benar mematikan prosesnya
+
+Bukan sekadar membaca konfigurasi:
+
+| Uji | Hasil |
+|---|---|
+| `kill -9` mosquitto (PID 278) | bangkit sebagai PID 992, `NRestarts=1` |
+| `kill -9` telemetry (PID 327) | bangkit sebagai PID 1009, terbit lagi ke MQTT |
+| `kill -9` sshd (PID 326) | bangkit sebagai PID 1722; dibuktikan dengan **koneksi SSH baru** |
+| Jalur gagal skrip WiFi | keluar 1 (sebelumnya 0) |
+| Jalur sukses skrip WiFi | alamat dan gateway tetap benar |
+
+Saat menguji `ssh`, pakai jaring pengaman supaya tidak kehilangan akses kalau kebijakannya
+ternyata tidak bekerja — jalankan pembunuhannya dari proses terlepas yang menghidupkan
+kembali sshd bila 12 detik kemudian ia masih mati. Pada uji ini jaring itu tidak terpakai.
+
+### 15.6 Yang masih belum tertutup
+
+**WiFi yang putus setelah unit sukses tidak akan terdeteksi.** Unitnya `oneshot`; setelah
+skripnya selesai dengan status 0, systemd tidak punya proses untuk diawasi. Kalau AP di-reboot
+atau dongle kehilangan asosiasi di tengah jalan, tidak ada yang menyadarinya.
+
+`Restart=` tidak bisa memecahkan ini — yang dibutuhkan adalah **pemeriksa berkala**: sebuah
+systemd timer yang memverifikasi asosiasi dan default route, lalu menjalankan ulang
+`luckfox-wifi.service` bila keduanya hilang. Belum diimplementasikan di repo ini.
+
+Untuk layanan yang programnya sendiri bisa melapor sehat, ada juga `WatchdogSec=` per unit
+dengan `sd_notify(WATCHDOG=1)` — lebih tajam daripada sekadar "prosesnya masih hidup", tapi
+menuntut perubahan pada programnya.
 
 ---
 
@@ -1389,7 +1528,9 @@ benar-benar dari sensor (bukan frame konstan yang ukurannya kebetulan benar).
 | `rmmod rockit` menggantung dan tidak bisa dibatalkan | Thread state D tidak dapat diinterupsi | Tidak bisa dilepas saat runtime — cegah saat boot (13.2) |
 | Login serial gagal padahal password benar | Perintah berikutnya termakan sebagai jawaban prompt | Tunggu `login:` lalu `Password:` satu per satu sebelum mengirim |
 | Service `enabled` tapi `inactive (dead)`, `journalctl -b -u` kosong | Siklus ordering systemd — unit `After=` service yang sendirinya `After=multi-user.target` | Ubah ke `After=network.target`; systemd membuang job tanpa pesan error |
-| `Refusing to reload, not enough space available on /run/systemd` saat `apt install` | tmpfs `/run` sempit di board 56 MB | Abaikan — paket dan service tetap terpasang; buat symlink `multi-user.target.wants` manual bila `systemctl enable` ikut gagal |
+| `Refusing to reload, not enough space available on /run/systemd` saat `apt install` | `/run` hanya 8,3 MB, lebih kecil dari cadangan 16 MB yang disyaratkan — jadi tidak akan pernah cukup | `sudo mount -o remount,size=24M /run` lalu pasang `run-resize.service` agar bertahan (15.1). `size` tmpfs hanya batas, bukan alokasi |
+| Layanan `Restart=on-failure` tidak pernah dicoba ulang | Skripnya keluar dengan status 0 pada kegagalan | Perbaiki kode keluar skripnya dulu — kebijakan restart tidak berguna tanpa itu (15.2) |
+| Layanan menyerah permanen setelah beberapa kali gagal | `RestartSec` bawaan 100 ms menghabiskan jatah 5 start dalam <1 detik | `StartLimitIntervalSec=0` + `RestartSec` yang wajar (15.3) |
 | Board statis tidak terjangkau setelah pindah jaringan | Alamat statis terikat satu subnet | Pastikan laptop di SSID yang sama; dongle 2,4 GHz tidak bisa 5 GHz |
 | Drop-in systemd diabaikan diam-diam, `Assignment outside of section` | Berkas `.conf` tanpa header seksi | Tambah `[Manager]` (system.conf) atau `[Journal]` (journald.conf) di baris pertama (14.5) |
 | `daemon-reexec` ditolak: `not enough space available on /run/systemd` | `/run` hanya 8,3 MB, systemd mensyaratkan cadangan 16 MB | Tidak bisa diakali — terapkan `system.conf` lewat reboot (14.5) |

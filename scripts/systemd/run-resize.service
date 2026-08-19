@@ -1,0 +1,33 @@
+# Pasang sebagai /etc/systemd/system/run-resize.service, lalu:
+#   sudo systemctl enable run-resize.service
+#
+# MASALAH YANG DIPECAHKAN
+# /run adalah tmpfs berukuran 10% RAM = 8,3 MB pada board 42 MB. systemd
+# menolak daemon-reload MAUPUN daemon-reexec kalau ruang bebas /run di bawah
+# 16 MB:
+#   Refusing to reload, not enough space available on /run/systemd.
+#   Currently, 5.8M are free, but a safety buffer of 16.0M is enforced.
+# Karena 8,3 MB < 16 MB, syarat itu tidak akan pernah terpenuhi bahkan saat
+# /run benar-benar kosong. Akibatnya setiap perubahan unit systemd hanya bisa
+# diterapkan lewat reboot, dan `systemctl enable` saat `apt install` ikut gagal.
+#
+# KENAPA AMAN
+# Parameter size pada tmpfs adalah BATAS ATAS, bukan alokasi. Menaikkannya
+# tidak memakan RAM sampai benar-benar ditulisi. Terukur di board ini:
+# MemAvailable hanya bergeser 21 MB -> 20 MB setelah /run dinaikkan ke 24 MB,
+# sementara pemakaian nyata /run tetap ~2 MB.
+
+[Unit]
+Description=Perbesar tmpfs /run agar systemd daemon-reload dapat berjalan
+Documentation=man:systemd.mount(5)
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/mount -o remount,size=24M /run
+
+[Install]
+WantedBy=sysinit.target
